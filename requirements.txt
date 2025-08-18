@@ -17,6 +17,7 @@ langchain-google-genai
 google-generativeai
 openpyxl
 pyarrow
+gradio
 tabulate
 html5lib
 duckdb
