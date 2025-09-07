@@ -10,11 +10,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import io
-import os
-import re
-import json
-import base64
-import tempfile
 import subprocess
 import logging
 from io import BytesIO
