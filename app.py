@@ -600,8 +600,11 @@ async def analyze_data(request: Request):
         questions_file = None
         data_file = None
 
+        # -----------------------------
+        # Identify files
+        # -----------------------------
         for key, val in form.items():
-            if hasattr(val, "filename") and val.filename:  # it's a file
+            if hasattr(val, "filename") and val.filename:
                 fname = val.filename.lower()
                 if fname.endswith(".txt") and questions_file is None:
                     questions_file = val
@@ -618,80 +621,130 @@ async def analyze_data(request: Request):
         df_preview = ""
         dataset_uploaded = False
 
+        # -----------------------------
+        # DATASET HANDLING (SAFE)
+        # -----------------------------
         if data_file:
             dataset_uploaded = True
             filename = data_file.filename.lower()
+
+            MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
+            MAX_ROWS = 10000
+            MAX_MEMORY = 50 * 1024 * 1024  # 50MB
+            MAX_COLUMNS = 50
+
             content = await data_file.read()
+
+            # 🔒 File size check
+            if len(content) > MAX_FILE_SIZE:
+                raise HTTPException(400, "File too large (max 5MB)")
+
             from io import BytesIO
 
+            # -----------------------------
+            # Load DataFrame
+            # -----------------------------
             if filename.endswith(".csv"):
                 df = pd.read_csv(BytesIO(content))
+
             elif filename.endswith((".xlsx", ".xls")):
                 df = pd.read_excel(BytesIO(content))
+
             elif filename.endswith(".parquet"):
                 df = pd.read_parquet(BytesIO(content))
+
             elif filename.endswith(".json"):
                 try:
                     df = pd.read_json(BytesIO(content))
                 except ValueError:
                     df = pd.DataFrame(json.loads(content.decode("utf-8")))
-            elif filename.endswith(".png") or filename.endswith(".jpg") or filename.endswith(".jpeg"):
-                try:
-                    if PIL_AVAILABLE:
-                        image = Image.open(BytesIO(content))
-                        image = image.convert("RGB")  # ensure RGB format
-                        df = pd.DataFrame({"image": [image]})
-                    else:
-                        raise HTTPException(400, "PIL not available for image processing")
-                except Exception as e:
-                    raise HTTPException(400, f"Image processing failed: {str(e)}")  
-            else:
-                raise HTTPException(400, f"Unsupported data file type: {filename}")
 
-            # Pickle for injection
+            elif filename.endswith((".png", ".jpg", ".jpeg")):
+                if not PIL_AVAILABLE:
+                    raise HTTPException(400, "PIL not available")
+
+                image = Image.open(BytesIO(content)).convert("RGB")
+                df = pd.DataFrame({"image": [image]})
+
+            else:
+                raise HTTPException(400, f"Unsupported file type: {filename}")
+
+            # -----------------------------
+            # LIMIT DATASET SIZE
+            # -----------------------------
+            if len(df) > MAX_ROWS:
+                df = df.head(MAX_ROWS)
+
+            if df.shape[1] > MAX_COLUMNS:
+                df = df.iloc[:, :MAX_COLUMNS]
+
+            # -----------------------------
+            # MEMORY CHECK
+            # -----------------------------
+            mem_usage = df.memory_usage(deep=True).sum()
+            if mem_usage > MAX_MEMORY:
+                raise HTTPException(400, "Dataset too large in memory")
+
+            # -----------------------------
+            # CLEAN TEXT COLUMNS
+            # -----------------------------
+            for col in df.select_dtypes(include=["object"]).columns:
+                df[col] = df[col].astype(str).str[:100]
+
+            # -----------------------------
+            # PICKLE (if still needed)
+            # -----------------------------
             temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
             temp_pkl.close()
             df.to_pickle(temp_pkl.name)
             pickle_path = temp_pkl.name
 
+            # -----------------------------
+            # SAFE PREVIEW (LLM INPUT)
+            # -----------------------------
             df_preview = (
-                f"\n\nThe uploaded dataset has {len(df)} rows and {len(df.columns)} columns.\n"
-                f"Columns: {', '.join(df.columns.astype(str))}\n"
-                f"First rows:\n{df.head(5).to_markdown(index=False)}\n"
+                f"\nDataset shape: {df.shape}\n"
+                f"Columns: {list(df.columns)}\n"
+                f"Preview:\n{df.head(5).to_string(index=False)}\n"
             )
 
-        # Build rules based on data presence
+        # -----------------------------
+        # RULES (UPDATED FOR JSON MODE)
+        # -----------------------------
         if dataset_uploaded:
             llm_rules = (
                 "Rules:\n"
-                "1) You have access to a pandas DataFrame called `df` and its dictionary form `data`.\n"
-                "2) DO NOT call scrape_url_to_dataframe() or fetch any external data.\n"
-                "3) Use only the uploaded dataset for answering questions.\n"
-                "4) Produce a final JSON object with keys:\n"
-                '   - "questions": [ ... original question strings ... ]\n'
-                '   - "code": "..."  (Python code that fills `results` with exact question strings as keys)\n'
-                "5) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
+                "1) Use ONLY the provided dataset.\n"
+                "2) Do NOT fetch external data.\n"
+                "3) Answer all questions directly.\n"
+                "4) Return ONLY valid JSON.\n"
+                "5) Output format:\n"
+                '{ "answers": { "question": "answer" } }\n'
             )
         else:
             llm_rules = (
                 "Rules:\n"
-                "1) If you need web data, CALL scrape_url_to_dataframe(url).\n"
-                "2) Produce a final JSON object with keys:\n"
-                '   - "questions": [ ... original question strings ... ]\n'
-                '   - "code": "..."  (Python code that fills `results` with exact question strings as keys)\n'
-                "3) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
+                "1) Answer questions directly.\n"
+                "2) You may use general knowledge.\n"
+                "3) Return ONLY valid JSON.\n"
+                "4) Output format:\n"
+                '{ "answers": { "question": "answer" } }\n'
             )
 
         llm_input = (
             f"{llm_rules}\nQuestions:\n{raw_questions}\n"
             f"{df_preview if df_preview else ''}"
-            "Respond with the JSON object only."
+            "Respond with JSON only."
         )
 
-        # Run agent
+        # -----------------------------
+        # RUN AGENT
+        # -----------------------------
         import concurrent.futures
+
         with concurrent.futures.ThreadPoolExecutor() as ex:
             fut = ex.submit(run_agent_safely_unified, llm_input, pickle_path)
+
             try:
                 result = fut.result(timeout=LLM_TIMEOUT_SECONDS)
             except concurrent.futures.TimeoutError:
@@ -700,7 +753,9 @@ async def analyze_data(request: Request):
         if "error" in result:
             raise HTTPException(500, detail=result["error"])
 
-        # Post-process key mapping & type casting
+        # -----------------------------
+        # TYPE CASTING (OPTIONAL)
+        # -----------------------------
         if keys_list and type_map:
             mapped = {}
             for idx, q in enumerate(result.keys()):
@@ -709,9 +764,6 @@ async def analyze_data(request: Request):
                     caster = type_map.get(key, str)
                     try:
                         val = result[q]
-                        if isinstance(val, str) and val.startswith("data:image/"):
-                            # Remove data URI prefix
-                            val = val.split(",", 1)[1] if "," in val else val
                         mapped[key] = caster(val) if val not in (None, "") else val
                     except Exception:
                         mapped[key] = result[q]
@@ -719,11 +771,11 @@ async def analyze_data(request: Request):
 
         return JSONResponse(content=result)
 
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        logger.exception("analyze_data failed")
-        raise HTTPException(500, detail=str(e))
+        except HTTPException as he:
+            raise he
+        except Exception as e:
+            logger.exception("analyze_data failed")
+            raise HTTPException(500, detail=str(e))
 
 
 def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
