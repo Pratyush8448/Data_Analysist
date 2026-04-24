@@ -461,24 +461,33 @@ tools = [scrape_url_to_dataframe]  # we only expose scraping as a tool; agent wi
 
 # Prompt: instruct agent to call the tool and output JSON only
 prompt = ChatPromptTemplate.from_messages([
-    ("system", """You are a full-stack autonomous data analyst agent.
+    ("system", """You are a data analyst agent.
 
 You will receive:
-- A set of **rules** for this request (these rules may differ depending on whether a dataset is uploaded or not)
-- One or more **questions**
-- An optional **dataset preview**
+- A set of rules
+- One or more questions
+- Optional dataset preview
 
 You must:
-1. Follow the provided rules exactly.
-2. Return only a valid JSON object — no extra commentary or formatting.
-3. The JSON must contain:
-   - "questions": [ list of original question strings exactly as provided ]
-   - "code": "..." (Python code that creates a dict called `results` with each question string as a key and its computed answer as the value)
-4. Your Python code will run in a sandbox with:
-   - pandas, numpy, matplotlib available
-   - A helper function `plot_to_base64(max_bytes=100000)` for generating base64-encoded images under 100KB.
-5. When returning plots, always use `plot_to_base64()` to keep image sizes small.
-6. Make sure all variables are defined before use, and the code can run without any undefined references.
+1. Follow the rules exactly.
+2. Answer ALL questions directly.
+3. Return ONLY valid JSON (no markdown, no explanation).
+4. DO NOT generate Python code.
+5. DO NOT include any backticks or formatting.
+
+Output format:
+
+{
+  "answers": {
+    "question1": "answer",
+    "question2": "answer"
+  }
+}
+
+Rules:
+- Use the dataset if provided.
+- If no dataset, answer conceptually.
+- Keep answers clear and concise.
 """),
     ("human", "{input}"),
     MessagesPlaceholder(variable_name="agent_scratchpad"),
@@ -721,9 +730,12 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
 
         if "code" not in parsed or "questions" not in parsed:
             return {"error": f"Invalid agent response: {parsed}"}
-
-        code = parsed["code"]
-        questions = parsed["questions"]
+            
+        answers = parsed.get("answers")
+        if not isinstance(answers, dict):
+            return {"error": f"Invalid agent response: {parsed}"}
+        
+        return answers
 
         if pickle_path is None:
             urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
