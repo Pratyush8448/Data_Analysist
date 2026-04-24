@@ -258,94 +258,41 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
 # -----------------------------
 # Utilities for executing code safely
 # -----------------------------
-def clean_llm_output(output: str) -> Dict:
+def safe_json_parse(output: str) -> Dict:
     """
-    Extract JSON object from LLM output robustly.
-    Returns dict or {"error": "..."}
+    Robust JSON extractor for LLM output.
+    Always returns dict OR {"error": "..."}
     """
     try:
         if not output:
             return {"error": "Empty LLM output"}
-        # remove triple-fence markers if present
-        s = re.sub(r"^```(?:json)?\s*", "", output.strip())
-        s = re.sub(r"\s*```$", "", s)
-        # find outermost JSON object by scanning for balanced braces
-        first = s.find("{")
-        last = s.rfind("}")
-        if first == -1 or last == -1 or last <= first:
-            return {"error": "No JSON object found in LLM output", "raw": s}
-        candidate = s[first:last+1]
+
+        # 🔹 Normalize
+        text = output.strip()
+
+        # remove markdown fences
+        text = text.replace("```json", "").replace("```", "")
+
+        # 🔹 Extract JSON block
+        start = text.find("{")
+        end = text.rfind("}")
+
+        if start == -1 or end == -1 or end <= start:
+            return {"error": "No valid JSON found", "raw": text}
+
+        json_str = text[start:end + 1]
+
+        # 🔹 Parse
         try:
-            return json.loads(candidate)
-        except Exception as e:
-            # fallback: try last balanced pair scanning backwards
-            for i in range(last, first, -1):
-                cand = s[first:i+1]
-                try:
-                    return json.loads(cand)
-                except Exception:
-                    continue
-            return {"error": f"JSON parsing failed: {str(e)}", "raw": candidate}
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            # attempt minor fixes
+            json_str = json_str.replace("\n", " ").replace("\t", " ")
+
+            return json.loads(json_str)
+
     except Exception as e:
-        return {"error": str(e)}
-
-SCRAPE_FUNC = r'''
-from typing import Dict, Any
-import requests
-from bs4 import BeautifulSoup
-import pandas as pd
-import re
-
-def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
-    try:
-        response = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=5
-        )
-        response.raise_for_status()
-    except Exception as e:
-        return {
-            "status": "error",
-            "error": str(e),
-            "data": [],
-            "columns": []
-        }
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    tables = pd.read_html(response.text)
-
-    if tables:
-        df = tables[0]  # Take first table
-        df.columns = [str(c).strip() for c in df.columns]
-        
-        # Ensure all columns are unique and string
-        df.columns = [str(col) for col in df.columns]
-
-        return {
-            "status": "success",
-            "data": df.to_dict(orient="records"),
-            "columns": list(df.columns)
-        }
-    else:
-        # Fallback to plain text
-        text_data = soup.get_text(separator="\n", strip=True)
-
-        # Try to detect possible "keys" from text like Runtime, Genre, etc.
-        detected_cols = set(re.findall(r"\b[A-Z][a-zA-Z ]{2,15}\b", text_data))
-        df = pd.DataFrame([{}])  # start empty
-        for col in detected_cols:
-            df[col] = None
-
-        if df.empty:
-            df["text"] = [text_data]
-
-        return {
-            "status": "success",
-            "data": df.to_dict(orient="records"),
-            "columns": list(df.columns)
-        }
-'''
+        return {"error": f"Parsing failed: {str(e)}", "raw": output}
 
 
 def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: int = 60) -> Dict[str, Any]:
@@ -780,59 +727,82 @@ async def analyze_data(request: Request):
 
 def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
     """
-    Runs the LLM agent and executes code.
-    - Retries up to 3 times if agent returns no output.
-    - If pickle_path is provided, injects that DataFrame directly.
-    - If no pickle_path, falls back to scraping when needed.
+    Runs LLM agent and safely returns structured JSON answers.
+    - Retries LLM call if no output
+    - Retries JSON parsing if invalid
+    - NO code execution (safe mode)
     """
+
     try:
-        max_retries = 3
+        MAX_LLM_RETRIES = 3
+        MAX_JSON_RETRIES = 3
+
         raw_out = ""
-        for attempt in range(1, max_retries + 1):
-            response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
-            raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
+
+        # -----------------------------
+        # 1. LLM CALL (retry if empty)
+        # -----------------------------
+        for attempt in range(MAX_LLM_RETRIES):
+            response = agent_executor.invoke(
+                {"input": llm_input},
+                {"timeout": LLM_TIMEOUT_SECONDS}
+            )
+
+            raw_out = (
+                response.get("output")
+                or response.get("final_output")
+                or response.get("text")
+                or ""
+            )
+
             if raw_out:
                 break
+
+            logger.warning(f"Empty LLM response (attempt {attempt+1})")
+
         if not raw_out:
-            return {"error": f"Agent returned no output after {max_retries} attempts"}
+            return {"error": "LLM returned no output after retries"}
 
-        parsed = clean_llm_output(raw_out)
-        if "error" in parsed:
-            return parsed
+        # -----------------------------
+        # 2. JSON PARSING (retry if broken)
+        # -----------------------------
+        for attempt in range(MAX_JSON_RETRIES):
+            parsed = safe_json_parse(raw_out)
 
-        if "code" not in parsed or "questions" not in parsed:
-            return {"error": f"Invalid agent response: {parsed}"}
-            
+            if "error" not in parsed:
+                break
+
+            logger.warning(f"JSON parse failed (attempt {attempt+1})")
+
+            # retry LLM call
+            response = agent_executor.invoke({"input": llm_input})
+
+            raw_out = (
+                response.get("output")
+                or response.get("final_output")
+                or response.get("text")
+                or ""
+            )
+
+        else:
+            return {"error": "Failed to get valid JSON from LLM"}
+
+        # -----------------------------
+        # 3. VALIDATION
+        # -----------------------------
         answers = parsed.get("answers")
+
         if not isinstance(answers, dict):
-            return {"error": f"Invalid agent response: {parsed}"}
-        
+            return {"error": f"Invalid response format: {parsed}"}
+
+        # -----------------------------
+        # 4. FINAL OUTPUT
+        # -----------------------------
         return answers
-
-        if pickle_path is None:
-            urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
-            if urls:
-                url = urls[0]
-                tool_resp = scrape_url_to_dataframe(url)
-                if tool_resp.get("status") != "success":
-                    return {"error": f"Scrape tool failed: {tool_resp.get('message')}"}
-                df = pd.DataFrame(tool_resp["data"])
-                temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-                temp_pkl.close()
-                df.to_pickle(temp_pkl.name)
-                pickle_path = temp_pkl.name
-
-        exec_result = write_and_run_temp_python(code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
-        if exec_result.get("status") != "success":
-            return {"error": f"Execution failed: {exec_result.get('message')}", "raw": exec_result.get("raw")}
-
-        results_dict = exec_result.get("result", {})
-        return {q: results_dict.get(q, "Answer not found") for q in questions}
 
     except Exception as e:
         logger.exception("run_agent_safely_unified failed")
         return {"error": str(e)}
-
 
     
 from fastapi.responses import FileResponse, Response
