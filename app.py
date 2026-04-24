@@ -80,39 +80,59 @@ class LLMWithFallback:
         self.temperature = temperature
         self.slow_keys_log = defaultdict(list)
         self.failing_keys_log = defaultdict(int)
-        self.current_llm = None  # placeholder for actual ChatGoogleGenerativeAI instance
+        self.current_llm = None
+        self.key_index = 0  
+        self.model_index = 0
 
     def _get_llm_instance(self):
-        last_error = None
-        for model in self.models:
-            for key in self.keys:
-                try:
-                    llm_instance = ChatGoogleGenerativeAI(
-                        model=model,
-                        temperature=self.temperature,
-                        google_api_key=key
-                    )
-                    self.current_llm = llm_instance
-                    return llm_instance
-                except Exception as e:
-                    last_error = e
-                    msg = str(e).lower()
-                    if any(qk in msg for qk in QUOTA_KEYWORDS):
-                        self.slow_keys_log[key].append(model)
-                    self.failing_keys_log[key] += 1
-                    time.sleep(0.5)
-        raise RuntimeError(f"All models/keys failed. Last error: {last_error}")
+    last_error = None
+    total_attempts = len(self.keys) * len(self.models)
+
+    for attempt in range(total_attempts):
+        key = self.keys[self.key_index]
+        model = self.models[self.model_index]
+
+        # 🔁 True round-robin rotation
+        self.key_index = (self.key_index + 1) % len(self.keys)
+        self.model_index = (self.model_index + 1) % len(self.models)
+
+        try:
+            logger.info(f"Trying model={model}, key_index={self.key_index}")
+
+            llm_instance = ChatGoogleGenerativeAI(
+                model=model,
+                temperature=self.temperature,
+                google_api_key=key
+            )
+
+            return llm_instance
+
+        except Exception as e:
+            last_error = e
+            msg = str(e).lower()
+
+            logger.warning(f"LLM failed: model={model}, error={msg}")
+
+            # 🚫 Skip permanently bad cases faster
+            if "quota" in msg or "limit" in msg or "429" in msg:
+                continue
+
+            time.sleep(0.2)
+
+    raise RuntimeError(f"All models/keys failed: {last_error}")
 
     # Required by LangChain agent
     def bind_tools(self, tools):
         llm_instance = self._get_llm_instance()
         return llm_instance.bind_tools(tools)
 
-    # Keep .invoke interface
+    import concurrent.futures
     def invoke(self, prompt):
         llm_instance = self._get_llm_instance()
-        return llm_instance.invoke(prompt)
-
+    
+        with concurrent.futures.ThreadPoolExecutor() as ex:
+            future = ex.submit(llm_instance.invoke, prompt)
+            return future.result(timeout=30)
 
 LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", 240))
 
