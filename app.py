@@ -113,7 +113,6 @@ class LLMWithFallback:
 
             logger.warning(f"LLM failed: model={model}, error={msg}")
 
-            # 🚫 Skip permanently bad cases faster
             if "quota" in msg or "limit" in msg or "429" in msg:
                 continue
 
@@ -482,61 +481,82 @@ agent_executor = AgentExecutor(
 # -----------------------------
 def run_agent_safely(llm_input: str) -> Dict:
     """
-    1. Run the agent_executor.invoke to get LLM output
-    2. Extract JSON, get 'code' and 'questions'
-    3. Detect scrape_url_to_dataframe("...") calls in code, run them here, pickle df and inject before exec
-    4. Execute the code in a temp file and return results mapping questions -> answers
+    Safe LLM execution:
+    - No code execution
+    - Strict JSON parsing
+    - Retry on failure
     """
+
     try:
-        response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
-        raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
+        MAX_LLM_RETRIES = 3
+        MAX_JSON_RETRIES = 3
+
+        raw_out = ""
+
+        # -----------------------------
+        # 1. LLM CALL (retry if empty)
+        # -----------------------------
+        for attempt in range(MAX_LLM_RETRIES):
+            response = agent_executor.invoke(
+                {"input": llm_input},
+                {"timeout": LLM_TIMEOUT_SECONDS}
+            )
+
+            raw_out = (
+                response.get("output")
+                or response.get("final_output")
+                or response.get("text")
+                or ""
+            )
+
+            if raw_out:
+                break
+
+            logger.warning(f"Empty LLM response (attempt {attempt+1})")
+
         if not raw_out:
-            return {"error": f"Agent returned no output. Full response: {response}"}
+            return {"error": "LLM returned no output after retries"}
 
-        parsed = clean_llm_output(raw_out)
-        if "error" in parsed:
-            return parsed
+        # -----------------------------
+        # 2. JSON PARSING (retry if broken)
+        # -----------------------------
+        for attempt in range(MAX_JSON_RETRIES):
+            parsed = safe_json_parse(raw_out)
 
-        if not isinstance(parsed, dict) or "code" not in parsed or "questions" not in parsed:
-            return {"error": f"Invalid agent response format: {parsed}"}
+            if "error" not in parsed:
+                break
 
-        code = parsed["code"]
-        questions: List[str] = parsed["questions"]
+            logger.warning(f"JSON parse failed (attempt {attempt+1})")
 
-        # Detect scrape calls; find all URLs used in scrape_url_to_dataframe("URL")
-        urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
-        pickle_path = None
-        if urls:
-            # For now support only the first URL (agent may code multiple scrapes; you can extend this)
-            url = urls[0]
-            tool_resp = scrape_url_to_dataframe(url)
-            if tool_resp.get("status") != "success":
-                return {"error": f"Scrape tool failed: {tool_resp.get('message')}"}
-            # create df and pickle it
-            df = pd.DataFrame(tool_resp["data"])
-            temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-            temp_pkl.close()
-            df.to_pickle(temp_pkl.name)
-            pickle_path = temp_pkl.name
-            # Make sure agent's code can reference df/data: we will inject the pickle loader in the temp script
+            # retry LLM call
+            response = agent_executor.invoke({"input": llm_input})
 
-        # Execute code in temp python script
-        exec_result = write_and_run_temp_python(code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
-        if exec_result.get("status") != "success":
-            return {"error": f"Execution failed: {exec_result.get('message', exec_result)}", "raw": exec_result.get("raw")}
+            raw_out = (
+                response.get("output")
+                or response.get("final_output")
+                or response.get("text")
+                or ""
+            )
 
-        # exec_result['result'] should be results dict
-        results_dict = exec_result.get("result", {})
-        # Map to original questions (they asked to use exact question strings)
-        output = {}
-        for q in questions:
-            output[q] = results_dict.get(q, "Answer not found")
-        return output
+        else:
+            return {"error": "Failed to get valid JSON from LLM"}
+
+        # -----------------------------
+        # 3. VALIDATE OUTPUT
+        # -----------------------------
+        answers = parsed.get("answers")
+
+        if not isinstance(answers, dict):
+            return {"error": f"Invalid response format: {parsed}"}
+
+        # -----------------------------
+        # 4. RETURN CLEAN OUTPUT
+        # -----------------------------
+        return answers
 
     except Exception as e:
         logger.exception("run_agent_safely failed")
         return {"error": str(e)}
-
 
 from fastapi import Request
 
