@@ -1,34 +1,50 @@
+# -------------------------
+# Standard Library
+# -------------------------
 import os
-import networkx as nx
 import re
-import json
-import base64
-import tempfile
 import sys
+import json
+import time
+import base64
+import socket
+import shutil
+import tempfile
+import subprocess
+import logging
+import traceback
+import asyncio
+from io import BytesIO
+from datetime import datetime, timedelta
+from functools import partial
+from typing import Dict, Any, List
+from concurrent.futures import ThreadPoolExecutor
+
+# -------------------------
+# Third-Party Libraries
+# -------------------------
+import requests
+import httpx
+import psutil
+import networkx as nx
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import io
-import os
-import re
-import json
-import base64
-import tempfile
-import subprocess
-import logging
-from io import BytesIO
-from typing import Dict, Any, List
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
-from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi import FastAPI
-from dotenv import load_dotenv
 
-import requests
-import pandas as pd
-import matplotlib.pyplot as plt
-import numpy as np
+import importlib.metadata
+
+# -------------------------
+# FastAPI
+# -------------------------
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Query
+from fastapi.responses import JSONResponse, HTMLResponse, FileResponse, Response
+
+# -------------------------
+# Environment
+# -------------------------
+from dotenv import load_dotenv
 
 # Optional image conversion
 try:
@@ -49,28 +65,42 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
-# -------------------- Robust Gemini LLM with fallback --------------------
+# -------------------- LLM Multi-Provider Config --------------------
 from collections import defaultdict
 import time
-from langchain_google_genai import ChatGoogleGenerativeAI
+import requests
 
-# Config
-GEMINI_KEYS = [os.getenv(f"gemini_api_{i}") for i in range(1, 11)]
-GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
+# Load Gemini keys (clean + deduplicated)
+GEMINI_KEYS = []
+for i in range(1, 11):
+    key = os.getenv(f"gemini_api_{i}")
+    if key and key.strip():
+        GEMINI_KEYS.append(key.strip())
 
+GEMINI_KEYS = list(dict.fromkeys(GEMINI_KEYS))  # remove duplicates
+
+# Grok config
+GROK_API_KEY = os.getenv("GROK_API_KEY")
+USE_GROK = os.getenv("USE_GROK", "false").lower() == "true"
+
+# Model hierarchy (Gemini)
 MODEL_HIERARCHY = [
-    "gemini-2.5-flash",        
-    "gemini-2.0-flash",        
-    "gemini-2.5-flash-lite",   
-    "gemini-2.0-flash-lite"   
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite"
 ]
 
 MAX_RETRIES_PER_KEY = 2
 TIMEOUT = 30
 QUOTA_KEYWORDS = ["quota", "exceeded", "rate limit", "403", "too many requests"]
 
-if not GEMINI_KEYS:
-    raise RuntimeError("No Gemini API keys found. Please set them in your environment.")
+# -------------------- Validation --------------------
+if not USE_GROK and not GEMINI_KEYS:
+    raise RuntimeError("No Gemini API keys found.")
+
+if USE_GROK and not GROK_API_KEY:
+    raise RuntimeError("USE_GROK=true but GROK_API_KEY missing.")
 
 # -------------------- LLM wrapper --------------------
 class LLMWithFallback:
@@ -78,152 +108,231 @@ class LLMWithFallback:
         self.keys = keys or GEMINI_KEYS
         self.models = models or MODEL_HIERARCHY
         self.temperature = temperature
+
+        self.current_llm = None
+        self.current_key = None
+        self.current_model = None
+
         self.slow_keys_log = defaultdict(list)
         self.failing_keys_log = defaultdict(int)
-        self.current_llm = None  # placeholder for actual ChatGoogleGenerativeAI instance
+
+    def _create_llm(self, key, model):
+        return ChatGoogleGenerativeAI(
+            model=model,
+            temperature=self.temperature,
+            google_api_key=key
+        )
 
     def _get_llm_instance(self):
+        if self.current_llm:
+            return self.current_llm
+
         last_error = None
+
         for model in self.models:
             for key in self.keys:
-                try:
-                    llm_instance = ChatGoogleGenerativeAI(
-                        model=model,
-                        temperature=self.temperature,
-                        google_api_key=key
-                    )
-                    self.current_llm = llm_instance
-                    return llm_instance
-                except Exception as e:
-                    last_error = e
-                    msg = str(e).lower()
-                    if any(qk in msg for qk in QUOTA_KEYWORDS):
-                        self.slow_keys_log[key].append(model)
-                    self.failing_keys_log[key] += 1
-                    time.sleep(0.5)
-        raise RuntimeError(f"All models/keys failed. Last error: {last_error}")
+                for attempt in range(MAX_RETRIES_PER_KEY):
+                    try:
+                        llm_instance = self._create_llm(key, model)
 
-    # Required by LangChain agent
+                        # Save working config
+                        self.current_llm = llm_instance
+                        self.current_key = key
+                        self.current_model = model
+
+                        logger.info(f"Using Gemini model={model} key={key[:6]}...")
+                        return llm_instance
+
+                    except Exception as e:
+                        last_error = e
+                        msg = str(e).lower()
+
+                        if any(qk in msg for qk in QUOTA_KEYWORDS):
+                            self.slow_keys_log[key].append(model)
+
+                        self.failing_keys_log[key] += 1
+                        time.sleep(0.5)
+
+        raise RuntimeError(f"All Gemini models/keys failed. Last error: {last_error}")
+
     def bind_tools(self, tools):
-        llm_instance = self._get_llm_instance()
-        return llm_instance.bind_tools(tools)
+        llm = self._get_llm_instance()
+        return llm.bind_tools(tools)
 
-    # Keep .invoke interface
     def invoke(self, prompt):
-        llm_instance = self._get_llm_instance()
-        return llm_instance.invoke(prompt)
+        try:
+            llm = self._get_llm_instance()
+            return llm.invoke(prompt)
+
+        except Exception as e:
+            logger.warning(f"LLM failed, resetting instance: {e}")
+
+            self.current_llm = None
+
+            llm = self._get_llm_instance()
+            return llm.invoke(prompt)
 
 
 LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", 240))
 
 
 @app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
-    """Serve the main HTML interface"""
     try:
-        with open("index.html", "r", encoding="utf-8") as f:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        file_path = os.path.join(base_dir, "index.html")
+
+        with open(file_path, "r", encoding="utf-8") as f:
             return HTMLResponse(content=f.read())
+
     except FileNotFoundError:
-        return HTMLResponse(content="<h1>Frontend not found</h1><p>Please ensure index.html is in the same directory as app.py</p>", status_code=404)
+        return HTMLResponse(
+            content="<h1>Frontend not found</h1><p>Ensure index.html exists</p>",
+            status_code=404
+        )
 
 
 def parse_keys_and_types(raw_questions: str):
     """
-    Parses the key/type section from the questions file.
-    Returns:
-        keys_list: list of keys in order
-        type_map: dict key -> casting function
+    Extracts structured keys and their expected types from input text.
     """
-    import re
-    pattern = r"-\s*`([^`]+)`\s*:\s*(\w+)"
+
+    pattern = r"-\s*`([^`]+)`\s*:\s*([a-zA-Z]+)"
     matches = re.findall(pattern, raw_questions)
+
+    if not matches:
+        return [], {}
+
     type_map_def = {
         "number": float,
-        "string": str,
+        "float": float,
         "integer": int,
         "int": int,
-        "float": float
+        "string": str
     }
-    type_map = {key: type_map_def.get(t.lower(), str) for key, t in matches}
-    keys_list = [k for k, _ in matches]
+
+    keys_list = []
+    type_map = {}
+
+    for key, t in matches:
+        t_clean = t.strip().lower()
+
+        keys_list.append(key)
+        type_map[key] = type_map_def.get(t_clean, str)
+
     return keys_list, type_map
 
 
 
 
-# -----------------------------
-# Tools
-# -----------------------------
-
 @tool
 def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
     """
-    Fetch a URL and return data as a DataFrame (supports HTML tables, CSV, Excel, Parquet, JSON, and plain text).
-    Always returns {"status": "success", "data": [...], "columns": [...]} if fetch works.
+    Robust URL scraper → returns structured dataframe-like output
     """
-    print(f"Scraping URL: {url}")
+    logger.info(f"Scraping URL: {url}")
+
     try:
         from io import BytesIO, StringIO
         from bs4 import BeautifulSoup
 
         headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/138.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": "Mozilla/5.0",
             "Referer": "https://www.google.com/",
         }
 
-        resp = requests.get(url, headers=headers, timeout=20)
-        resp.raise_for_status()
+        # -------------------------
+        # Retry logic
+        # -------------------------
+        last_error = None
+        for _ in range(2):
+            try:
+                resp = requests.get(url, headers=headers, timeout=15)
+                resp.raise_for_status()
+                break
+            except Exception as e:
+                last_error = e
+                time.sleep(1)
+        else:
+            return {"status": "error", "message": str(last_error)}
+
         ctype = resp.headers.get("Content-Type", "").lower()
+        content = resp.content[:2_000_000]  # limit size (~2MB)
 
         df = None
 
-        # --- CSV ---
+        # -------------------------
+        # CSV
+        # -------------------------
         if "text/csv" in ctype or url.lower().endswith(".csv"):
-            df = pd.read_csv(BytesIO(resp.content))
+            df = pd.read_csv(BytesIO(content))
 
-        # --- Excel ---
-        elif any(url.lower().endswith(ext) for ext in (".xls", ".xlsx")) or "spreadsheetml" in ctype:
-            df = pd.read_excel(BytesIO(resp.content))
+        # -------------------------
+        # Excel
+        # -------------------------
+        elif any(url.lower().endswith(ext) for ext in (".xls", ".xlsx")):
+            df = pd.read_excel(BytesIO(content))
 
-        # --- Parquet ---
+        # -------------------------
+        # Parquet
+        # -------------------------
         elif url.lower().endswith(".parquet"):
-            df = pd.read_parquet(BytesIO(resp.content))
+            df = pd.read_parquet(BytesIO(content))
 
-        # --- JSON ---
+        # -------------------------
+        # JSON
+        # -------------------------
         elif "application/json" in ctype or url.lower().endswith(".json"):
             try:
                 data = resp.json()
                 df = pd.json_normalize(data)
             except Exception:
-                df = pd.DataFrame([{"text": resp.text}])
+                df = pd.DataFrame([{"text": resp.text[:5000]}])
 
-        # --- HTML / Fallback ---
-        elif "text/html" in ctype or re.search(r'/wiki/|\.org|\.com', url, re.IGNORECASE):
+        # -------------------------
+        # HTML
+        # -------------------------
+        elif "text/html" in ctype:
             html_content = resp.text
-            # Try HTML tables first
+
+            # Try table extraction
             try:
-                tables = pd.read_html(StringIO(html_content), flavor="bs4")
+                tables = pd.read_html(StringIO(html_content))
                 if tables:
                     df = tables[0]
-            except ValueError:
+            except Exception:
                 pass
 
-            # If no table found, fallback to plain text
-            if df is None:
+            # Fallback → plain text
+            if df is None or df.empty:
                 soup = BeautifulSoup(html_content, "html.parser")
                 text = soup.get_text(separator="\n", strip=True)
-                df = pd.DataFrame({"text": [text]})
 
-        # --- Unknown type fallback ---
-        else:
-            df = pd.DataFrame({"text": [resp.text]})
+                df = pd.DataFrame({
+                    "text": [text[:5000]]  # truncate
+                })
 
-        # --- Normalize columns ---
-        df.columns = df.columns.map(str).str.replace(r'\[.*\]', '', regex=True).str.strip()
+        # -------------------------
+        # Fallback
+        # -------------------------
+        if df is None or df.empty:
+            df = pd.DataFrame({
+                "text": [resp.text[:5000]]
+            })
+
+        # -------------------------
+        # Normalize columns
+        # -------------------------
+        df.columns = (
+            df.columns
+            .map(str)
+            .str.replace(r'\[.*?\]', '', regex=True)
+            .str.strip()
+        )
+
+        # Limit rows (prevent huge payloads)
+        df = df.head(200)
 
         return {
             "status": "success",
@@ -232,42 +341,63 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
         }
 
     except Exception as e:
+        logger.exception("Scraping failed")
         return {"status": "error", "message": str(e)}
 
-
-# -----------------------------
-# Utilities for executing code safely
-# -----------------------------
 def clean_llm_output(output: str) -> Dict:
     """
-    Extract JSON object from LLM output robustly.
-    Returns dict or {"error": "..."}
+    Extract the most likely valid JSON object from LLM output.
+    Returns parsed dict or {"error": "..."}
     """
     try:
         if not output:
             return {"error": "Empty LLM output"}
-        # remove triple-fence markers if present
-        s = re.sub(r"^```(?:json)?\s*", "", output.strip())
-        s = re.sub(r"\s*```$", "", s)
-        # find outermost JSON object by scanning for balanced braces
-        first = s.find("{")
-        last = s.rfind("}")
-        if first == -1 or last == -1 or last <= first:
-            return {"error": "No JSON object found in LLM output", "raw": s}
-        candidate = s[first:last+1]
-        try:
-            return json.loads(candidate)
-        except Exception as e:
-            # fallback: try last balanced pair scanning backwards
-            for i in range(last, first, -1):
-                cand = s[first:i+1]
-                try:
-                    return json.loads(cand)
-                except Exception:
-                    continue
-            return {"error": f"JSON parsing failed: {str(e)}", "raw": candidate}
+
+        s = output.strip()
+
+        # Remove markdown fences
+        s = re.sub(r"^```(?:json)?", "", s)
+        s = re.sub(r"```$", "", s)
+
+        # -------------------------
+        # Extract all JSON candidates using brace stack
+        # -------------------------
+        stack = []
+        start = -1
+        candidates = []
+
+        for i, ch in enumerate(s):
+            if ch == "{":
+                if not stack:
+                    start = i
+                stack.append(ch)
+
+            elif ch == "}":
+                if stack:
+                    stack.pop()
+                    if not stack and start != -1:
+                        candidates.append(s[start:i+1])
+
+        if not candidates:
+            return {"error": "No JSON found", "raw": s}
+
+        # -------------------------
+        # Try parsing (largest first)
+        # -------------------------
+        for cand in sorted(candidates, key=len, reverse=True):
+            try:
+                return json.loads(cand)
+            except Exception:
+                continue
+
+        return {
+            "error": "JSON parsing failed",
+            "raw": candidates[-1]
+        }
+
     except Exception as e:
         return {"error": str(e)}
+    
 
 SCRAPE_FUNC = r'''
 from typing import Dict, Any
@@ -275,13 +405,14 @@ import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 import re
+from io import StringIO
 
 def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
     try:
         response = requests.get(
             url,
             headers={"User-Agent": "Mozilla/5.0"},
-            timeout=5
+            timeout=8
         )
         response.raise_for_status()
     except Exception as e:
@@ -292,53 +423,57 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
             "columns": []
         }
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    tables = pd.read_html(response.text)
+    content_type = response.headers.get("Content-Type", "").lower()
+    html = response.text[:1_000_000]  # limit size
 
-    if tables:
-        df = tables[0]  # Take first table
-        df.columns = [str(c).strip() for c in df.columns]
-        
-        # Ensure all columns are unique and string
-        df.columns = [str(col) for col in df.columns]
+    df = None
 
-        return {
-            "status": "success",
-            "data": df.to_dict(orient="records"),
-            "columns": list(df.columns)
-        }
-    else:
-        # Fallback to plain text
+    # -------------------------
+    # Try extracting tables
+    # -------------------------
+    if "html" in content_type:
+        try:
+            tables = pd.read_html(StringIO(html))
+            if tables:
+                df = tables[0]
+        except Exception:
+            df = None
+
+    # -------------------------
+    # Fallback → text
+    # -------------------------
+    if df is None or df.empty:
+        soup = BeautifulSoup(html, "html.parser")
         text_data = soup.get_text(separator="\n", strip=True)
 
-        # Try to detect possible "keys" from text like Runtime, Genre, etc.
-        detected_cols = set(re.findall(r"\b[A-Z][a-zA-Z ]{2,15}\b", text_data))
-        df = pd.DataFrame([{}])  # start empty
-        for col in detected_cols:
-            df[col] = None
+        # simple fallback dataframe
+        df = pd.DataFrame({
+            "text": [text_data[:3000]]  # truncate
+        })
 
-        if df.empty:
-            df["text"] = [text_data]
+    # -------------------------
+    # Normalize columns
+    # -------------------------
+    df.columns = [
+        str(col).strip() for col in df.columns
+    ]
 
-        return {
-            "status": "success",
-            "data": df.to_dict(orient="records"),
-            "columns": list(df.columns)
-        }
+    # limit rows
+    df = df.head(100)
+
+    return {
+        "status": "success",
+        "data": df.to_dict(orient="records"),
+        "columns": list(df.columns)
+    }
 '''
 
 
 def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: int = 60) -> Dict[str, Any]:
     """
-    Write a temp python file which:
-      - provides a safe environment (imports)
-      - loads df/from pickle if provided into df and data variables
-      - defines a robust plot_to_base64() helper that ensures < 100kB (attempts resizing/conversion)
-      - executes the user code (which should populate `results` dict)
-      - prints json.dumps({"status":"success","result":results})
-    Returns dict with parsed JSON or error details.
+    Safe execution sandbox for LLM-generated code
     """
-    # create file content
+
     preamble = [
         "import json, sys, gc",
         "import pandas as pd, numpy as np",
@@ -348,26 +483,26 @@ def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: i
         "from io import BytesIO",
         "import base64",
     ]
+
     if PIL_AVAILABLE:
         preamble.append("from PIL import Image")
-    # inject df if a pickle path provided
-    if injected_pickle:
-        preamble.append(f"df = pd.read_pickle(r'''{injected_pickle}''')\n")
-        preamble.append("data = df.to_dict(orient='records')\n")
-    else:
-        # ensure data exists so user code that references data won't break
-        preamble.append("data = globals().get('data', {})\n")
 
-    # plot_to_base64 helper that tries to reduce size under 100_000 bytes
+    if injected_pickle:
+        preamble.append(f"df = pd.read_pickle(r'''{injected_pickle}''')")
+        preamble.append("data = df.to_dict(orient='records')")
+    else:
+        preamble.append("data = globals().get('data', {})")
+
     helper = r'''
 def plot_to_base64(max_bytes=100000):
     buf = BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', dpi=100)
     buf.seek(0)
     img_bytes = buf.getvalue()
+
     if len(img_bytes) <= max_bytes:
         return base64.b64encode(img_bytes).decode('ascii')
-    # try decreasing dpi/figure size iteratively
+
     for dpi in [80, 60, 50, 40, 30]:
         buf = BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight', dpi=dpi)
@@ -375,44 +510,29 @@ def plot_to_base64(max_bytes=100000):
         b = buf.getvalue()
         if len(b) <= max_bytes:
             return base64.b64encode(b).decode('ascii')
-    # if Pillow available, try convert to WEBP which is typically smaller
-    try:
-        from PIL import Image
-        buf = BytesIO()
-        plt.savefig(buf, format='png', bbox_inches='tight', dpi=40)
-        buf.seek(0)
-        im = Image.open(buf)
-        out_buf = BytesIO()
-        im.save(out_buf, format='WEBP', quality=80, method=6)
-        out_buf.seek(0)
-        ob = out_buf.getvalue()
-        if len(ob) <= max_bytes:
-            return base64.b64encode(ob).decode('ascii')
-        # try lower quality
-        out_buf = BytesIO()
-        im.save(out_buf, format='WEBP', quality=60, method=6)
-        out_buf.seek(0)
-        ob = out_buf.getvalue()
-        if len(ob) <= max_bytes:
-            return base64.b64encode(ob).decode('ascii')
-    except Exception:
-        pass
-    # as last resort return downsized PNG even if > max_bytes
-    buf = BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight', dpi=20)
-    buf.seek(0)
-    return base64.b64encode(buf.getvalue()).decode('ascii')
+
+    return base64.b64encode(img_bytes).decode('ascii')
 '''
 
-    # Build the code to write
     script_lines = []
     script_lines.extend(preamble)
     script_lines.append(helper)
     script_lines.append(SCRAPE_FUNC)
     script_lines.append("\nresults = {}\n")
+
+    # Basic safety filter
+    if any(x in code for x in ["import os", "subprocess", "sys.exit", "open("]):
+        return {"status": "error", "message": "Unsafe code detected"}
+
     script_lines.append(code)
-    # ensure results printed as json
-    script_lines.append("\nprint(json.dumps({'status':'success','result':results}, default=str), flush=True)\n")
+
+    # Always ensure output
+    script_lines.append("""
+try:
+    print(json.dumps({'status':'success','result':results}, default=str), flush=True)
+except Exception as e:
+    print(json.dumps({'status':'error','message':str(e)}), flush=True)
+""")
 
     tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8')
     tmp.write("\n".join(script_lines))
@@ -421,20 +541,53 @@ def plot_to_base64(max_bytes=100000):
     tmp.close()
 
     try:
-        completed = subprocess.run([sys.executable, tmp_path],
-                                   capture_output=True, text=True, timeout=timeout)
+        completed = subprocess.run(
+            [sys.executable, tmp_path],
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+
+        stdout = completed.stdout.strip()
+        stderr = completed.stderr.strip()
+
         if completed.returncode != 0:
-            # collect stderr and stdout for debugging
-            return {"status": "error", "message": completed.stderr.strip() or completed.stdout.strip()}
-        # parse stdout as json
-        out = completed.stdout.strip()
-        try:
-            parsed = json.loads(out)
-            return parsed
-        except Exception as e:
-            return {"status": "error", "message": f"Could not parse JSON output: {str(e)}", "raw": out}
+            logger.error("Execution failed")
+            logger.error("STDOUT:\n%s", stdout)
+            logger.error("STDERR:\n%s", stderr)
+
+            return {
+                "status": "error",
+                "message": stderr or stdout
+            }
+
+        # -------------------------
+        # Extract JSON safely
+        # -------------------------
+        matches = re.findall(r"\{.*\}", stdout, re.DOTALL)
+
+        if not matches:
+            return {
+                "status": "error",
+                "message": "No JSON output",
+                "raw": stdout
+            }
+
+        for cand in reversed(matches):
+            try:
+                return json.loads(cand)
+            except Exception:
+                continue
+
+        return {
+            "status": "error",
+            "message": "JSON parsing failed",
+            "raw": stdout
+        }
+
     except subprocess.TimeoutExpired:
         return {"status": "error", "message": "Execution timed out"}
+
     finally:
         try:
             os.unlink(tmp_path)
@@ -445,116 +598,195 @@ def plot_to_base64(max_bytes=100000):
 
 
 # -----------------------------
-# LLM agent setup
+# LLM Selection (UPDATED)
 # -----------------------------
-# llm = ChatGoogleGenerativeAI(
-#     model=os.getenv("GOOGLE_MODEL", "gemini-2.5-pro"),
-#     temperature=0,
-#     google_api_key=os.getenv("GOOGLE_API_KEY")
-# )
-# -------------------- Initialize LLM --------------------
-llm = LLMWithFallback(temperature=0)
+if USE_GROK:
+    logger.info("Using Grok LLM")
+    llm = GrokLLM(api_key=GROK_API_KEY)
+else:
+    logger.info(f"Using Gemini with {len(GEMINI_KEYS)} keys")
+    llm = LLMWithFallback(temperature=0)
+
+
 # -----------------------------
+# Tools
+# -----------------------------
+tools = [scrape_url_to_dataframe]
 
-# Tools list for agent (LangChain tool decorator returns metadata for the LLM)
-tools = [scrape_url_to_dataframe]  # we only expose scraping as a tool; agent will still produce code
 
-# Prompt: instruct agent to call the tool and output JSON only
+# -----------------------------
+# Prompt
+# -----------------------------
 prompt = ChatPromptTemplate.from_messages([
     ("system", """You are a full-stack autonomous data analyst agent.
 
 You will receive:
-- A set of **rules** for this request (these rules may differ depending on whether a dataset is uploaded or not)
+- A set of **rules** for this request
 - One or more **questions**
 - An optional **dataset preview**
 
 You must:
 1. Follow the provided rules exactly.
-2. Return only a valid JSON object — no extra commentary or formatting.
-3. The JSON must contain:
-   - "questions": [ list of original question strings exactly as provided ]
-   - "code": "..." (Python code that creates a dict called `results` with each question string as a key and its computed answer as the value)
-4. Your Python code will run in a sandbox with:
+2. Return only a valid JSON object — no extra commentary.
+3. JSON must contain:
+   - "questions": [...]
+   - "code": "..." (Python code that fills `results` dict)
+
+4. Execution environment:
    - pandas, numpy, matplotlib available
-   - A helper function `plot_to_base64(max_bytes=100000)` for generating base64-encoded images under 100KB.
-5. When returning plots, always use `plot_to_base64()` to keep image sizes small.
-6. Make sure all variables are defined before use, and the code can run without any undefined references.
+   - helper: plot_to_base64(max_bytes=100000)
+
+5. Always define variables before use.
+6. Code must run without errors.
 """),
     ("human", "{input}"),
     MessagesPlaceholder(variable_name="agent_scratchpad"),
 ])
 
+
+# -----------------------------
+# Agent Creation
+# -----------------------------
 agent = create_tool_calling_agent(
     llm=llm,
-    tools=[scrape_url_to_dataframe],  # let the agent call tools if it wants; we will also pre-process scrapes
+    tools=tools,
     prompt=prompt
 )
 
+
+# -----------------------------
+# Agent Executor (Improved)
+# -----------------------------
 agent_executor = AgentExecutor(
     agent=agent,
-    tools=[scrape_url_to_dataframe],
+    tools=tools,
     verbose=True,
-    max_iterations=3,
+
+    max_iterations=5,
+
+    # Better stopping
     early_stopping_method="generate",
-    handle_parsing_errors=True,
+
+    # Handle bad outputs more gracefully
+    handle_parsing_errors="Check your output and return valid JSON only.",
+
+    # Keep clean output
     return_intermediate_steps=False
 )
 
 
 # -----------------------------
 # Runner: orchestrates agent -> pre-scrape inject -> execute
-# -----------------------------
 def run_agent_safely(llm_input: str) -> Dict:
     """
-    1. Run the agent_executor.invoke to get LLM output
-    2. Extract JSON, get 'code' and 'questions'
-    3. Detect scrape_url_to_dataframe("...") calls in code, run them here, pickle df and inject before exec
-    4. Execute the code in a temp file and return results mapping questions -> answers
+    Orchestrates:
+    1. Agent execution
+    2. JSON extraction
+    3. Optional scraping + dataframe injection
+    4. Safe code execution
     """
-    try:
-        response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
-        raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
-        if not raw_out:
-            return {"error": f"Agent returned no output. Full response: {response}"}
 
+    try:
+        # -------------------------
+        # Run agent
+        # -------------------------
+        response = agent_executor.invoke(
+            {"input": llm_input},
+            {"timeout": LLM_TIMEOUT_SECONDS}
+        )
+
+        raw_out = (
+            response.get("output")
+            or response.get("final_output")
+            or response.get("text")
+            or str(response)
+        )
+
+        if not raw_out:
+            return {"error": f"No output from agent", "raw": response}
+
+        logger.info("LLM RAW OUTPUT:\n%s", raw_out[:1000])
+
+        # -------------------------
+        # Parse JSON
+        # -------------------------
         parsed = clean_llm_output(raw_out)
+
         if "error" in parsed:
             return parsed
 
-        if not isinstance(parsed, dict) or "code" not in parsed or "questions" not in parsed:
-            return {"error": f"Invalid agent response format: {parsed}"}
+        if not isinstance(parsed, dict):
+            return {"error": "Parsed output is not dict", "raw": parsed}
+
+        if "code" not in parsed or "questions" not in parsed:
+            return {"error": "Missing required keys", "raw": parsed}
 
         code = parsed["code"]
         questions: List[str] = parsed["questions"]
 
-        # Detect scrape calls; find all URLs used in scrape_url_to_dataframe("URL")
-        urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
+        logger.info("EXECUTING CODE:\n%s", code[:1000])
+
+        # -------------------------
+        # Basic safety check
+        # -------------------------
+        if any(x in code for x in ["import os", "subprocess", "sys.exit", "open("]):
+            return {"error": "Unsafe code detected"}
+
+        # -------------------------
+        # Detect and run scrape calls
+        # -------------------------
+        urls = list(set(re.findall(
+            r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code
+        )))
+
         pickle_path = None
+
         if urls:
-            # For now support only the first URL (agent may code multiple scrapes; you can extend this)
+            # Use first URL (can extend later)
             url = urls[0]
+
             tool_resp = scrape_url_to_dataframe(url)
+
             if tool_resp.get("status") != "success":
-                return {"error": f"Scrape tool failed: {tool_resp.get('message')}"}
-            # create df and pickle it
-            df = pd.DataFrame(tool_resp["data"])
+                return {"error": f"Scrape failed: {tool_resp.get('message')}"}
+
+            df = pd.DataFrame(tool_resp.get("data", []))
+
+            if df.empty:
+                return {"error": "Scraped dataframe is empty"}
+
             temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
             temp_pkl.close()
+
             df.to_pickle(temp_pkl.name)
             pickle_path = temp_pkl.name
-            # Make sure agent's code can reference df/data: we will inject the pickle loader in the temp script
 
-        # Execute code in temp python script
-        exec_result = write_and_run_temp_python(code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
+        # -------------------------
+        # Execute code
+        # -------------------------
+        exec_result = write_and_run_temp_python(
+            code,
+            injected_pickle=pickle_path,
+            timeout=LLM_TIMEOUT_SECONDS
+        )
+
         if exec_result.get("status") != "success":
-            return {"error": f"Execution failed: {exec_result.get('message', exec_result)}", "raw": exec_result.get("raw")}
+            return {
+                "error": f"Execution failed",
+                "message": exec_result.get("message"),
+                "raw": exec_result.get("raw")
+            }
 
-        # exec_result['result'] should be results dict
         results_dict = exec_result.get("result", {})
-        # Map to original questions (they asked to use exact question strings)
+
+        # -------------------------
+        # Map results to questions
+        # -------------------------
         output = {}
+
         for q in questions:
             output[q] = results_dict.get(q, "Answer not found")
+
         return output
 
     except Exception as e:
@@ -562,17 +794,20 @@ def run_agent_safely(llm_input: str) -> Dict:
         return {"error": str(e)}
 
 
-from fastapi import Request
 
 @app.post("/api")
 async def analyze_data(request: Request):
     try:
         form = await request.form()
+
         questions_file = None
         data_file = None
 
-        for key, val in form.items():
-            if hasattr(val, "filename") and val.filename:  # it's a file
+        # -------------------------
+        # Extract files
+        # -------------------------
+        for _, val in form.items():
+            if hasattr(val, "filename") and val.filename:
                 fname = val.filename.lower()
                 if fname.endswith(".txt") and questions_file is None:
                     questions_file = val
@@ -589,109 +824,134 @@ async def analyze_data(request: Request):
         df_preview = ""
         dataset_uploaded = False
 
+        # -------------------------
+        # Handle dataset
+        # -------------------------
         if data_file:
             dataset_uploaded = True
             filename = data_file.filename.lower()
             content = await data_file.read()
             from io import BytesIO
 
-            if filename.endswith(".csv"):
-                df = pd.read_csv(BytesIO(content))
-            elif filename.endswith((".xlsx", ".xls")):
-                df = pd.read_excel(BytesIO(content))
-            elif filename.endswith(".parquet"):
-                df = pd.read_parquet(BytesIO(content))
-            elif filename.endswith(".json"):
-                try:
-                    df = pd.read_json(BytesIO(content))
-                except ValueError:
-                    df = pd.DataFrame(json.loads(content.decode("utf-8")))
-            elif filename.endswith(".png") or filename.endswith(".jpg") or filename.endswith(".jpeg"):
-                try:
-                    if PIL_AVAILABLE:
-                        image = Image.open(BytesIO(content))
-                        image = image.convert("RGB")  # ensure RGB format
-                        df = pd.DataFrame({"image": [image]})
-                    else:
-                        raise HTTPException(400, "PIL not available for image processing")
-                except Exception as e:
-                    raise HTTPException(400, f"Image processing failed: {str(e)}")  
-            else:
-                raise HTTPException(400, f"Unsupported data file type: {filename}")
+            try:
+                if filename.endswith(".csv"):
+                    df = pd.read_csv(BytesIO(content))
 
-            # Pickle for injection
+                elif filename.endswith((".xlsx", ".xls")):
+                    df = pd.read_excel(BytesIO(content))
+
+                elif filename.endswith(".parquet"):
+                    df = pd.read_parquet(BytesIO(content))
+
+                elif filename.endswith(".json"):
+                    try:
+                        df = pd.read_json(BytesIO(content))
+                    except Exception:
+                        df = pd.DataFrame(json.loads(content.decode("utf-8")))
+
+                elif filename.endswith((".png", ".jpg", ".jpeg")):
+                    if not PIL_AVAILABLE:
+                        raise HTTPException(400, "PIL not available")
+
+                    image = Image.open(BytesIO(content)).convert("RGB")
+                    df = pd.DataFrame({"image": [image]})
+
+                else:
+                    raise HTTPException(400, f"Unsupported file type: {filename}")
+
+            except Exception as e:
+                raise HTTPException(400, f"Failed to load dataset: {str(e)}")
+
+            # Prevent huge datasets
+            if len(df) > 10000:
+                df = df.head(10000)
+
+            # Pickle dataset
             temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
             temp_pkl.close()
             df.to_pickle(temp_pkl.name)
             pickle_path = temp_pkl.name
 
             df_preview = (
-                f"\n\nThe uploaded dataset has {len(df)} rows and {len(df.columns)} columns.\n"
-                f"Columns: {', '.join(df.columns.astype(str))}\n"
-                f"First rows:\n{df.head(5).to_markdown(index=False)}\n"
+                f"\nDataset info:\n"
+                f"- Rows: {len(df)}, Columns: {len(df.columns)}\n"
+                f"- Columns: {', '.join(df.columns.astype(str))}\n"
+                f"- Sample:\n{df.head(5).to_markdown(index=False)}\n"
             )
 
-        # Build rules based on data presence
+        # -------------------------
+        # Build LLM rules
+        # -------------------------
         if dataset_uploaded:
             llm_rules = (
                 "Rules:\n"
-                "1) You have access to a pandas DataFrame called `df` and its dictionary form `data`.\n"
-                "2) DO NOT call scrape_url_to_dataframe() or fetch any external data.\n"
-                "3) Use only the uploaded dataset for answering questions.\n"
-                "4) Produce a final JSON object with keys:\n"
-                '   - "questions": [ ... original question strings ... ]\n'
-                '   - "code": "..."  (Python code that fills `results` with exact question strings as keys)\n'
-                "5) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
+                "1) Use provided DataFrame `df` only.\n"
+                "2) DO NOT call scrape_url_to_dataframe().\n"
+                "3) Return JSON with keys: questions, code.\n"
+                "4) Code must fill `results` dict.\n"
+                "5) Use plot_to_base64() for plots.\n"
             )
         else:
             llm_rules = (
                 "Rules:\n"
-                "1) If you need web data, CALL scrape_url_to_dataframe(url).\n"
-                "2) Produce a final JSON object with keys:\n"
-                '   - "questions": [ ... original question strings ... ]\n'
-                '   - "code": "..."  (Python code that fills `results` with exact question strings as keys)\n'
-                "3) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
+                "1) If needed, call scrape_url_to_dataframe(url).\n"
+                "2) Return JSON with keys: questions, code.\n"
+                "3) Code must fill `results` dict.\n"
             )
 
         llm_input = (
             f"{llm_rules}\nQuestions:\n{raw_questions}\n"
-            f"{df_preview if df_preview else ''}"
-            "Respond with the JSON object only."
+            f"{df_preview}"
+            "Respond with JSON only."
         )
 
-        # Run agent
+        logger.info("LLM INPUT:\n%s", llm_input[:1000])
+
+        # -------------------------
+        # Run agent safely
+        # -------------------------
         import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as ex:
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             fut = ex.submit(run_agent_safely_unified, llm_input, pickle_path)
+
             try:
                 result = fut.result(timeout=LLM_TIMEOUT_SECONDS)
             except concurrent.futures.TimeoutError:
                 raise HTTPException(408, "Processing timeout")
 
+        if not isinstance(result, dict):
+            raise HTTPException(500, "Invalid agent result")
+
         if "error" in result:
             raise HTTPException(500, detail=result["error"])
 
-        # Post-process key mapping & type casting
+        # -------------------------
+        # Map keys + cast types
+        # -------------------------
         if keys_list and type_map:
             mapped = {}
-            for idx, q in enumerate(result.keys()):
+
+            for idx, (q, val) in enumerate(result.items()):
                 if idx < len(keys_list):
                     key = keys_list[idx]
                     caster = type_map.get(key, str)
+
                     try:
-                        val = result[q]
                         if isinstance(val, str) and val.startswith("data:image/"):
-                            # Remove data URI prefix
                             val = val.split(",", 1)[1] if "," in val else val
+
                         mapped[key] = caster(val) if val not in (None, "") else val
                     except Exception:
-                        mapped[key] = result[q]
+                        mapped[key] = val
+
             result = mapped
 
         return JSONResponse(content=result)
 
-    except HTTPException as he:
-        raise he
+    except HTTPException:
+        raise
+
     except Exception as e:
         logger.exception("analyze_data failed")
         raise HTTPException(500, detail=str(e))
@@ -699,62 +959,144 @@ async def analyze_data(request: Request):
 
 def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
     """
-    Runs the LLM agent and executes code.
-    - Retries up to 3 times if agent returns no output.
-    - If pickle_path is provided, injects that DataFrame directly.
-    - If no pickle_path, falls back to scraping when needed.
+    Unified runner:
+    - retries agent
+    - parses JSON safely
+    - handles scraping if needed
+    - executes code
     """
+
     try:
         max_retries = 3
         raw_out = ""
+
+        # -------------------------
+        # Retry agent execution
+        # -------------------------
         for attempt in range(1, max_retries + 1):
-            response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
-            raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
+            response = agent_executor.invoke(
+                {"input": llm_input},
+                {"timeout": LLM_TIMEOUT_SECONDS}
+            )
+
+            raw_out = (
+                response.get("output")
+                or response.get("final_output")
+                or response.get("text")
+                or str(response)
+            )
+
             if raw_out:
                 break
-        if not raw_out:
-            return {"error": f"Agent returned no output after {max_retries} attempts"}
 
+            logger.warning(f"Attempt {attempt} returned empty output")
+
+        if not raw_out:
+            return {"error": f"No output after {max_retries} attempts"}
+
+        logger.info("LLM RAW OUTPUT:\n%s", raw_out[:1000])
+
+        # -------------------------
+        # Parse JSON
+        # -------------------------
         parsed = clean_llm_output(raw_out)
+
         if "error" in parsed:
             return parsed
 
+        if not isinstance(parsed, dict):
+            return {"error": "Parsed output is not dict", "raw": parsed}
+
         if "code" not in parsed or "questions" not in parsed:
-            return {"error": f"Invalid agent response: {parsed}"}
+            return {"error": "Invalid agent response format", "raw": parsed}
 
         code = parsed["code"]
         questions = parsed["questions"]
 
+        logger.info("EXEC CODE:\n%s", code[:1000])
+
+        # -------------------------
+        # Basic safety filter
+        # -------------------------
+        if any(x in code for x in ["import os", "subprocess", "sys.exit", "open("]):
+            return {"error": "Unsafe code detected"}
+
+        # -------------------------
+        # Handle scraping (if no dataset)
+        # -------------------------
         if pickle_path is None:
-            urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
+            urls = list(set(re.findall(
+                r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code
+            )))
+
             if urls:
                 url = urls[0]
+
                 tool_resp = scrape_url_to_dataframe(url)
+
                 if tool_resp.get("status") != "success":
-                    return {"error": f"Scrape tool failed: {tool_resp.get('message')}"}
-                df = pd.DataFrame(tool_resp["data"])
+                    return {"error": f"Scrape failed: {tool_resp.get('message')}"}
+
+                df = pd.DataFrame(tool_resp.get("data", []))
+
+                if df.empty:
+                    return {"error": "Scraped dataframe is empty"}
+
                 temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
                 temp_pkl.close()
+
                 df.to_pickle(temp_pkl.name)
                 pickle_path = temp_pkl.name
 
-        exec_result = write_and_run_temp_python(code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
+        # -------------------------
+        # Execute generated code
+        # -------------------------
+        exec_result = write_and_run_temp_python(
+            code,
+            injected_pickle=pickle_path,
+            timeout=LLM_TIMEOUT_SECONDS
+        )
+
         if exec_result.get("status") != "success":
-            return {"error": f"Execution failed: {exec_result.get('message')}", "raw": exec_result.get("raw")}
+            logger.error("Execution failed: %s", exec_result)
+            return {
+                "error": "Execution failed",
+                "message": exec_result.get("message"),
+                "raw": exec_result.get("raw")
+            }
 
         results_dict = exec_result.get("result", {})
-        return {q: results_dict.get(q, "Answer not found") for q in questions}
+
+        if not isinstance(results_dict, dict):
+            return {"error": "Execution returned invalid results", "raw": results_dict}
+
+        # -------------------------
+        # FIX: normalize mapping
+        # -------------------------
+        output = {}
+
+        result_items = list(results_dict.items())
+
+        for idx, q in enumerate(questions):
+            try:
+                # map by position instead of exact match
+                _, val = result_items[idx]
+                output[q] = val
+            except Exception:
+                output[q] = "Answer not found"
+
+        return output
 
     except Exception as e:
         logger.exception("run_agent_safely_unified failed")
         return {"error": str(e)}
 
 
-    
-from fastapi.responses import FileResponse, Response
-import base64, os
 
-# 1×1 transparent PNG fallback (if favicon.ico file not present)
+
+## -------------------------
+# Favicon fallback
+# -------------------------
 _FAVICON_FALLBACK_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO3n+9QAAAAASUVORK5CYII="
 )
@@ -762,354 +1104,232 @@ _FAVICON_FALLBACK_PNG = base64.b64decode(
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
     """
-    Serve favicon.ico if present in the working directory.
-    Otherwise return a tiny transparent PNG to avoid 404s.
+    Serve favicon.ico if present, else return a tiny PNG.
     """
-    path = "favicon.ico"
-    if os.path.exists(path):
-        return FileResponse(path, media_type="image/x-icon")
-    return Response(content=_FAVICON_FALLBACK_PNG, media_type="image/png")
+    try:
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(base_dir, "favicon.ico")
 
+        if os.path.exists(path):
+            return FileResponse(path, media_type="image/x-icon")
+
+        return Response(content=_FAVICON_FALLBACK_PNG, media_type="image/png")
+
+    except Exception as e:
+        logger.warning(f"Favicon error: {e}")
+        return Response(content=_FAVICON_FALLBACK_PNG, media_type="image/png")
+
+
+# -------------------------
+# Health check endpoint
+# -------------------------
 @app.get("/api", include_in_schema=False)
 async def analyze_get_info():
-    """Health/info endpoint. Use POST /api for actual analysis."""
+    """
+    Health/info endpoint.
+    """
     return JSONResponse({
         "ok": True,
-        "message": "Server is running. Use POST /api with 'questions_file' and optional 'data_file'.",
-
+        "service": "TDS Data Analyst Agent",
+        "status": "running",
+        "llm_mode": "grok" if USE_GROK else "gemini",
+        "gemini_keys_loaded": len(GEMINI_KEYS),
+        "message": "Use POST /api with 'questions_file' and optional 'data_file'."
     })
 
 
 
 # -----------------------------
 # System Diagnostics
-# -----------------------------
-# ---- Add these imports near other imports at top of app.py ----
-import asyncio
-import httpx
-import importlib.metadata
-import traceback
-from concurrent.futures import ThreadPoolExecutor
-from functools import partial
-from datetime import datetime, timedelta
-import socket
-import platform
-import psutil
-import shutil
-import tempfile
-import os
-import time 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, HTMLResponse    
-
+# ----------------------------
 # ---- Configuration for diagnostics (tweak as needed) ----
+# ---- Configuration for diagnostics ----
 DIAG_NETWORK_TARGETS = {
     "Google AI": "https://generativelanguage.googleapis.com",
     "AISTUDIO": "https://aistudio.google.com/",
     "OpenAI": "https://api.openai.com",
     "GitHub": "https://api.github.com",
 }
-DIAG_LLM_KEY_TIMEOUT = 30  # seconds per key/model simple ping test (sync tests run in threadpool)
-DIAG_PARALLELISM = 6       # how many thread workers for sync checks
-RUN_LONGER_CHECKS = False  # Playwright/duckdb tests run only if true (they can be slow)
 
-# Use existing GEMINI_KEYS / MODEL_HIERARCHY from your app. If not defined, create empty lists.
-try:
-    _GEMINI_KEYS = GEMINI_KEYS
-    _MODEL_HIERARCHY = MODEL_HIERARCHY
-except NameError:
-    _GEMINI_KEYS = []
-    _MODEL_HIERARCHY = []
+DIAG_LLM_KEY_TIMEOUT = 20
+DIAG_PARALLELISM = 4
+RUN_LONGER_CHECKS = False
 
-# helper: iso timestamp
+
+# -------------------------
+# Safe access to globals
+# -------------------------
+_GEMINI_KEYS = globals().get("GEMINI_KEYS", [])
+_MODEL_HIERARCHY = globals().get("MODEL_HIERARCHY", [])
+
+
+# -------------------------
+# Helpers
+# -------------------------
 def _now_iso():
     return datetime.utcnow().isoformat() + "Z"
 
-# helper: run sync func in threadpool and return result / exception info
+
 _executor = ThreadPoolExecutor(max_workers=DIAG_PARALLELISM)
+
 async def run_in_thread(fn, *a, timeout=30, **kw):
     loop = asyncio.get_running_loop()
     try:
         task = loop.run_in_executor(_executor, partial(fn, *a, **kw))
         return await asyncio.wait_for(task, timeout=timeout)
     except asyncio.TimeoutError:
-        raise TimeoutError("timeout")
-    except Exception as e:
-        # re-raise for caller to capture stacktrace easily
-        raise
-
-# ---- Diagnostic check functions (safely return dicts) ----
-def _env_check(required=None):
-    required = required or []
-    out = {}
-    for k in required:
-        out[k] = {"present": bool(os.getenv(k)), "masked": (os.getenv(k)[:4] + "..." + os.getenv(k)[-4:]) if os.getenv(k) else None}
-    # Also include simple helpful values
-    out["GOOGLE_MODEL"] = os.getenv("GOOGLE_MODEL")
-    out["LLM_TIMEOUT_SECONDS"] = os.getenv("LLM_TIMEOUT_SECONDS")
-    return out
-
-def _system_info():
-    info = {
-        "host": socket.gethostname(),
-        "platform": platform.system(),
-        "platform_release": platform.release(),
-        "python_version": platform.python_version(),
-        "cpu_logical_cores": psutil.cpu_count(logical=True),
-        "memory_total_gb": round(psutil.virtual_memory().total / 1024**3, 2),
-    }
-    # disk free for app dir and tmp
-    try:
-        _cwd = os.getcwd()
-        info["cwd_free_gb"] = round(shutil.disk_usage(_cwd).free / 1024**3, 2)
-    except Exception:
-        info["cwd_free_gb"] = None
-    try:
-        info["tmp_free_gb"] = round(shutil.disk_usage(tempfile.gettempdir()).free / 1024**3, 2)
-    except Exception:
-        info["tmp_free_gb"] = None
-    # GPU quick probe (if torch installed)
-    try:
-        import torch
-        info["torch_installed"] = True
-        info["cuda_available"] = torch.cuda.is_available()
-        if torch.cuda.is_available():
-            info["cuda_device_name"] = torch.cuda.get_device_name(0)
-    except Exception:
-        info["torch_installed"] = False
-        info["cuda_available"] = False
-    return info
-
-def _temp_write_test():
-    tmp = tempfile.gettempdir()
-    path = os.path.join(tmp, f"diag_test_{int(time.time())}.tmp")
-    with open(path, "w") as f:
-        f.write("ok")
-    ok = os.path.exists(path)
-    os.remove(path)
-    return {"tmp_dir": tmp, "write_ok": ok}
-
-def _app_write_test():
-    # try writing into current working directory
-    cwd = os.getcwd()
-    path = os.path.join(cwd, f"diag_test_{int(time.time())}.tmp")
-    with open(path, "w") as f:
-        f.write("ok")
-    ok = os.path.exists(path)
-    os.remove(path)
-    return {"cwd": cwd, "write_ok": ok}
-
-def _pandas_pipeline_test():
-    import pandas as _pd
-    df = _pd.DataFrame({"x":[1,2,3], "y":[4,5,6]})
-    df["z"] = df["x"] * df["y"]
-    agg = df["z"].sum()
-    return {"rows": df.shape[0], "cols": df.shape[1], "z_sum": int(agg)}
-
-def _installed_packages_sample():
-    # return top 20 installed package names + versions
-    try:
-        out = []
-        for dist in importlib.metadata.distributions():
-            try:
-                out.append(f"{dist.metadata['Name']}=={dist.version}")
-            except Exception:
-                try:
-                    out.append(f"{dist.metadata['Name']}")
-                except Exception:
-                    continue
-        return {"sample_packages": sorted(out)[:20]}
+        return {"error": "timeout"}
     except Exception as e:
         return {"error": str(e)}
 
-def _network_probe_sync(url, timeout=30):
-    # synchronous network probe for threadpool use
+
+# -------------------------
+# Checks
+# -------------------------
+def _env_check(required=None):
+    required = required or []
+    out = {}
+
+    for k in required:
+        val = os.getenv(k)
+        out[k] = {
+            "present": bool(val),
+            "masked": (val[:4] + "..." + val[-4:]) if val else None
+        }
+
+    out["USE_GROK"] = os.getenv("USE_GROK")
+    out["LLM_TIMEOUT_SECONDS"] = os.getenv("LLM_TIMEOUT_SECONDS")
+
+    return out
+
+
+def _system_info():
     try:
-        r = requests.head(url, timeout=timeout)
-        return {"ok": True, "status_code": r.status_code, "latency_ms": int(r.elapsed.total_seconds()*1000)}
+        return {
+            "host": socket.gethostname(),
+            "platform": platform.system(),
+            "python_version": platform.python_version(),
+            "cpu_cores": psutil.cpu_count(logical=True),
+            "memory_gb": round(psutil.virtual_memory().total / 1024**3, 2),
+            "cwd_free_gb": round(shutil.disk_usage(os.getcwd()).free / 1024**3, 2),
+            "tmp_free_gb": round(shutil.disk_usage(tempfile.gettempdir()).free / 1024**3, 2),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _temp_write_test():
+    try:
+        path = os.path.join(tempfile.gettempdir(), f"diag_{int(time.time())}.tmp")
+        with open(path, "w") as f:
+            f.write("ok")
+        os.remove(path)
+        return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ---- LLM key+model light test (sync) ----
-# tries each key for each model with a short per-call timeout (run in threadpool)
-def _test_gemini_key_model(key, model, ping_text="ping"):
-    """
-    Test a Gemini API key by sending a minimal request.
-    Always returns a pure dict with only primitive types.
-    """
+
+def _pandas_pipeline_test():
+    try:
+        df = pd.DataFrame({"x": [1, 2], "y": [3, 4]})
+        df["z"] = df["x"] * df["y"]
+        return {"ok": True, "z_sum": int(df["z"].sum())}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _network_probe_sync(url):
+    try:
+        r = requests.head(url, timeout=10)
+        return {"ok": True, "status": r.status_code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _test_gemini_key_model(key, model):
     try:
         from langchain_google_genai import ChatGoogleGenerativeAI
-    except Exception as e:
-        return {"ok": False, "error": f"langchain_google_genai import error: {e}"}
 
-    try:
-        obj = ChatGoogleGenerativeAI(
+        llm = ChatGoogleGenerativeAI(
             model=model,
             temperature=0,
             google_api_key=key
         )
 
-        def extract_text(resp):
-            """Normalize any type of LLM response into a clean string."""
-            try:
-                if resp is None:
-                    return None
-                if isinstance(resp, str):
-                    return resp
-                if hasattr(resp, "content") and isinstance(resp.content, str):
-                    return resp.content
-                if hasattr(resp, "text") and isinstance(resp.text, str):
-                    return resp.text
-                # For objects with .dict() method
-                if hasattr(resp, "dict"):
-                    try:
-                        return str(resp.dict())
-                    except Exception:
-                        pass
-                return str(resp)
-            except Exception as e:
-                return f"[unreadable response: {e}]"
+        resp = llm.invoke("ping")
+        text = str(resp)[:100] if resp else None
 
-        # First try invoke()
-        try:
-            resp = obj.invoke(ping_text)
-            text = extract_text(resp)
-            return {"ok": True, "model": model, "summary": text[:200] if text else None}
-        except Exception as e_invoke:
-            # Try __call__()
-            try:
-                resp = obj.__call__(ping_text)
-                text = extract_text(resp)
-                return {"ok": True, "model": model, "summary": text[:200] if text else None}
-            except Exception as e_call:
-                return {"ok": False, "error": f"invoke failed: {e_invoke}; call failed: {e_call}"}
+        return {"ok": True, "model": model, "response": text}
 
-    except Exception as e_outer:
-        return {"ok": False, "error": str(e_outer)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
-# ---- Async wrappers that call the sync checks in threadpool ----
+
+# -------------------------
+# Async wrappers
+# -------------------------
 async def check_network():
-    coros = []
-    for name, url in DIAG_NETWORK_TARGETS.items():
-        coros.append(run_in_thread(_network_probe_sync, url, timeout=30))
-    results = await asyncio.gather(*[asyncio.create_task(c) for c in coros], return_exceptions=True)
-    out = {}
-    for (name, _), res in zip(DIAG_NETWORK_TARGETS.items(), results):
-        if isinstance(res, Exception):
-            out[name] = {"ok": False, "error": str(res)}
-        else:
-            out[name] = res
-    return out
+    tasks = [
+        run_in_thread(_network_probe_sync, url)
+        for url in DIAG_NETWORK_TARGETS.values()
+    ]
+
+    results = await asyncio.gather(*tasks)
+    return dict(zip(DIAG_NETWORK_TARGETS.keys(), results))
+
 
 async def check_llm_keys_models():
-    """Try all GEMINI_KEYS on each model (light-touch). Runs in threadpool with per-key timeout."""
     if not _GEMINI_KEYS:
-        return {"warning": "no GEMINI_KEYS configured"}
+        return {"warning": "No Gemini keys configured"}
 
-    results = []
-    # we will stop early if we find a working combo but still record attempts
-    for model in (_MODEL_HIERARCHY or ["gemini-2.5-pro"]):
-        # test keys in parallel for this model
-        tasks = []
-        for key in _GEMINI_KEYS:
-            tasks.append(run_in_thread(_test_gemini_key_model, key, model, timeout=DIAG_LLM_KEY_TIMEOUT))
-        completed = await asyncio.gather(*[asyncio.create_task(t) for t in tasks], return_exceptions=True)
-        model_summary = {"model": model, "attempts": []}
-        any_ok = False
-        for key, res in zip(_GEMINI_KEYS, completed):
-            if isinstance(res, Exception):
-                model_summary["attempts"].append({"key_mask": (key[:4] + "..." + key[-4:]) if key else None, "ok": False, "error": str(res)})
-            else:
-                # res is dict returned by _test_gemini_key_model
-                model_summary["attempts"].append({"key_mask": (key[:4] + "..." + key[-4:]) if key else None, **res})
-                if res.get("ok"):
-                    any_ok = True
-        results.append(model_summary)
-        if any_ok:
-            # stop once first model has a working key (respecting MODEL_HIERARCHY)
-            break
-    return {"models_tested": results}
+    for model in (_MODEL_HIERARCHY or ["gemini-2.5-flash"]):
+        tasks = [
+            run_in_thread(_test_gemini_key_model, key, model, timeout=DIAG_LLM_KEY_TIMEOUT)
+            for key in _GEMINI_KEYS
+        ]
 
-# ---- Optional slow heavy checks (DuckDB, Playwright) ----
-async def check_duckdb():
-    try:
-        import duckdb
-        def duck_check():
-            conn = duckdb.connect(":memory:")
-            conn.execute("SELECT 1")
-            conn.close()
-            return {"duckdb": True}
-        return await run_in_thread(duck_check, timeout=30)
-    except Exception as e:
-        return {"duckdb_error": str(e)}
+        results = await asyncio.gather(*tasks)
 
-async def check_playwright():
-    try:
-        from playwright.async_api import async_playwright
-        async with async_playwright() as p:
-            b = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-            page = await b.new_page()
-            await page.goto("about:blank")
-            ua = await page.evaluate("() => navigator.userAgent")
-            await b.close()
-            return {"playwright_ok": True, "ua": ua[:200]}
-    except Exception as e:
-        return {"playwright_error": str(e)}
+        if any(r.get("ok") for r in results if isinstance(r, dict)):
+            return {"model": model, "working": True}
 
-# ---- Final /diagnose route (concurrent) ----
-from fastapi import Query
+    return {"working": False}
 
+
+# -------------------------
+# Diagnose endpoint
+# -------------------------
 @app.get("/summary")
-async def diagnose(full: bool = Query(False, description="If true, run extended checks (duckdb/playwright)")):
+async def diagnose(full: bool = Query(False)):
     started = datetime.utcnow()
-    report = {
-        "status": "ok",
-        "server_time": _now_iso(),
-        "summary": {},
-        "checks": {},
-        "elapsed_seconds": None
-    }
 
-    # prepare tasks
-    tasks = {
-        "env": run_in_thread(_env_check, ["GOOGLE_API_KEY", "GOOGLE_MODEL", "LLM_TIMEOUT_SECONDS"], timeout=3),
-        "system": run_in_thread(_system_info, timeout=30),
-        "tmp_write": run_in_thread(_temp_write_test, timeout=30),
-        "cwd_write": run_in_thread(_app_write_test, timeout=30),
-        "pandas": run_in_thread(_pandas_pipeline_test, timeout=30),
-        "packages": run_in_thread(_installed_packages_sample, timeout=50),
+    checks = {
+        "env": run_in_thread(_env_check, ["GOOGLE_API_KEY"]),
+        "system": run_in_thread(_system_info),
+        "temp": run_in_thread(_temp_write_test),
+        "pandas": run_in_thread(_pandas_pipeline_test),
         "network": asyncio.create_task(check_network()),
-        "llm_keys_models": asyncio.create_task(check_llm_keys_models())
+        "llm": asyncio.create_task(check_llm_keys_models())
     }
 
-    if full or RUN_LONGER_CHECKS:
-        tasks["duckdb"] = asyncio.create_task(check_duckdb())
-        tasks["playwright"] = asyncio.create_task(check_playwright())
+    if full:
+        checks["duckdb"] = asyncio.create_task(check_duckdb())
+        checks["playwright"] = asyncio.create_task(check_playwright())
 
-    # run all concurrently, collect results
     results = {}
-    for name, coro in tasks.items():
+
+    for name, task in checks.items():
         try:
-            res = await coro
-            results[name] = {"status": "ok", "result": res}
-        except TimeoutError:
-            results[name] = {"status": "timeout", "error": "check timed out"}
+            results[name] = await task
         except Exception as e:
-            results[name] = {"status": "error", "error": str(e), "trace": traceback.format_exc()}
+            results[name] = {"error": str(e)}
 
-    report["checks"] = results
-
-    # quick summary flags
-    failed = [k for k, v in results.items() if v.get("status") != "ok"]
-    if failed:
-        report["status"] = "warning"
-        report["summary"]["failed_checks"] = failed
-    else:
-        report["status"] = "ok"
-        report["summary"]["failed_checks"] = []
-
-    report["elapsed_seconds"] = (datetime.utcnow() - started).total_seconds()
-    return report
+    return {
+        "status": "ok",
+        "time": _now_iso(),
+        "elapsed_sec": (datetime.utcnow() - started).total_seconds(),
+        "checks": results
+    }
 
 
 if __name__ == "__main__":
